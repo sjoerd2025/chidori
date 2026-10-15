@@ -52,7 +52,7 @@ const JSON_HEADERS = { "content-type": "application/json" };
  * client computes the same value without the server ever handing one out
  * (matches `blob_etag` in crates/chidori/src/runtime/store.rs).
  */
-async function etag(bytes: ArrayBuffer): Promise<string> {
+export async function etag(bytes: ArrayBuffer): Promise<string> {
   const digest = await crypto.subtle.digest("SHA-256", bytes);
   const hex = Array.from(new Uint8Array(digest))
     .map((b) => b.toString(16).padStart(2, "0"))
@@ -111,6 +111,10 @@ export class ChidoriRun {
       if (rows.length === 0) {
         return new Response("no journal", { status: 404 });
       }
+      console.info({
+        event: "run.records.read",
+        count: rows.length,
+      });
       const body = `[${rows.map((r) => r.data as string).join(",")}]`;
       return new Response(body, { headers: JSON_HEADERS });
     }
@@ -125,6 +129,11 @@ export class ChidoriRun {
         next,
         JSON.stringify(record),
       );
+      console.info({
+        event: "run.record.appended",
+        seq: record.seq,
+        pos: next,
+      });
       return new Response("ok");
     }
     if (request.method === "PUT") {
@@ -138,6 +147,10 @@ export class ChidoriRun {
           JSON.stringify(record),
         );
       });
+      console.info({
+        event: "run.journal.replaced",
+        count: records.length,
+      });
       return new Response("ok");
     }
     return new Response("method not allowed", { status: 405 });
@@ -147,6 +160,10 @@ export class ChidoriRun {
     const sql = this.storage.sql;
     if (request.method === "GET" && key === "") {
       const rows = sql.exec("SELECT key FROM blobs ORDER BY key").toArray();
+      console.info({
+        event: "run.blobs.listed",
+        count: rows.length,
+      });
       return new Response(JSON.stringify(rows.map((r) => r.key)), {
         headers: JSON_HEADERS,
       });
@@ -159,14 +176,27 @@ export class ChidoriRun {
       if (rows.length === 0) {
         return new Response("not found", { status: 404 });
       }
+      console.info({
+        event: "run.blob.read",
+        key,
+      });
       return new Response(rows[0].data as ArrayBuffer);
     }
     if (request.method === "PUT" || request.method === "DELETE") {
       if (!(await this.preconditionHolds(request, key))) {
+        console.warn({
+          event: "run.blob.precondition_failed",
+          key,
+          status: 412,
+        });
         return new Response("precondition failed", { status: 412 });
       }
       if (request.method === "DELETE") {
         sql.exec("DELETE FROM blobs WHERE key = ?", key);
+        console.info({
+          event: "run.blob.deleted",
+          key,
+        });
         return new Response("ok");
       }
       const data = await request.arrayBuffer();
@@ -176,6 +206,11 @@ export class ChidoriRun {
         key,
         data,
       );
+      console.info({
+        event: "run.blob.stored",
+        key,
+        size: data.byteLength,
+      });
       return new Response("ok");
     }
     return new Response("method not allowed", { status: 405 });
@@ -213,6 +248,10 @@ export class ChidoriRun {
     if (segments[0] === "runs") {
       if (request.method === "GET") {
         const rows = sql.exec("SELECT run_id FROM runs ORDER BY run_id").toArray();
+        console.info({
+          event: "index.runs.listed",
+          count: rows.length,
+        });
         return new Response(JSON.stringify(rows.map((r) => r.run_id)), {
           headers: JSON_HEADERS,
         });
@@ -220,6 +259,10 @@ export class ChidoriRun {
       if (request.method === "POST") {
         const { runId } = (await request.json()) as { runId: string };
         sql.exec("INSERT OR IGNORE INTO runs (run_id) VALUES (?)", runId);
+        console.info({
+          event: "index.run.registered",
+          runId,
+        });
         return new Response("ok");
       }
     }
@@ -227,6 +270,10 @@ export class ChidoriRun {
       const name = decodeURIComponent(segments.slice(1).join("/"));
       if (request.method === "GET" && name === "") {
         const rows = sql.exec("SELECT data FROM registry ORDER BY name").toArray();
+        console.info({
+          event: "registry.entries.listed",
+          count: rows.length,
+        });
         const body = `[${rows.map((r) => r.data as string).join(",")}]`;
         return new Response(body, { headers: JSON_HEADERS });
       }
@@ -235,6 +282,10 @@ export class ChidoriRun {
         if (rows.length === 0) {
           return new Response("not found", { status: 404 });
         }
+        console.info({
+          event: "registry.entry.read",
+          name,
+        });
         return new Response(rows[0].data as string, { headers: JSON_HEADERS });
       }
       if (request.method === "PUT") {
@@ -245,6 +296,10 @@ export class ChidoriRun {
           name,
           data,
         );
+        console.info({
+          event: "registry.entry.stored",
+          name,
+        });
         return new Response("ok");
       }
     }
@@ -262,7 +317,7 @@ export class ChidoriRun {
  * this is that check in the Worker. Every byte of the longer string is examined
  * regardless of the outcome — a length difference is all that leaks.
  */
-function constantTimeEqual(a: string, b: string): boolean {
+export function constantTimeEqual(a: string, b: string): boolean {
   const encoder = new TextEncoder();
   const left = encoder.encode(a);
   const right = encoder.encode(b);
@@ -275,33 +330,38 @@ function constantTimeEqual(a: string, b: string): boolean {
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
+    const start = Date.now();
+    const url = new URL(request.url);
+
     if (env.CHIDORI_RUN_STORE_TOKEN) {
       const auth = request.headers.get("authorization") ?? "";
       if (!constantTimeEqual(auth, `Bearer ${env.CHIDORI_RUN_STORE_TOKEN}`)) {
+        console.warn({
+          event: "auth.unauthorized",
+          method: request.method,
+          path: url.pathname,
+        });
         return new Response("unauthorized", { status: 401 });
       }
     }
 
-    const url = new URL(request.url);
     const segments = url.pathname.split("/").filter(Boolean);
     const indexStub = env.RUN.get(env.RUN.idFromName("@index"));
 
+    let response: Response;
+
     // GET /runs → the singleton index object.
     if (segments[0] === "runs" && segments.length === 1) {
-      return indexStub.fetch(new Request(`${url.origin}/index/runs`, request));
-    }
-
-    // /registry[...] → the singleton index object.
-    if (segments[0] === "registry") {
+      response = await indexStub.fetch(new Request(`${url.origin}/index/runs`, request));
+    } else if (segments[0] === "registry") {
+      // /registry[...] → the singleton index object.
       const rest = segments.slice(1).map(encodeURIComponent).join("/");
-      return indexStub.fetch(
+      response = await indexStub.fetch(
         new Request(`${url.origin}/index/registry/${rest}`, request),
       );
-    }
-
-    // /runs/:id/... → the run's own object, re-rooted past the id. First
-    // write registers the run in the index so GET /runs can enumerate.
-    if (segments[0] === "runs" && segments.length >= 2) {
+    } else if (segments[0] === "runs" && segments.length >= 2) {
+      // /runs/:id/... → the run's own object, re-rooted past the id. First
+      // write registers the run in the index so GET /runs can enumerate.
       const runId = decodeURIComponent(segments[1]);
       const rest = segments.slice(2).join("/");
       if (request.method !== "GET") {
@@ -314,9 +374,20 @@ export default {
         );
       }
       const stub = env.RUN.get(env.RUN.idFromName(runId));
-      return stub.fetch(new Request(`${url.origin}/${rest}${url.search}`, request));
+      response = await stub.fetch(new Request(`${url.origin}/${rest}${url.search}`, request));
+    } else {
+      response = new Response("not found", { status: 404 });
     }
 
-    return new Response("not found", { status: 404 });
+    console.info({
+      event: "chidori.invocation",
+      method: request.method,
+      path: url.pathname,
+      status: response.status,
+      durationMs: Date.now() - start,
+    });
+
+    return response;
   },
 } satisfies ExportedHandler<Env>;
+

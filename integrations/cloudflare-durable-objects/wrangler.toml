@@ -20,3 +20,10 @@ new_sqlite_classes = ["ChidoriRun"]
 #   wrangler secret put CHIDORI_RUN_STORE_TOKEN
 # and export the same value as CHIDORI_RUN_STORE_TOKEN next to the chidori
 # process.
+
+[observability]
+enabled = true
+head_sampling_rate = 1
+
+[observability.logs]
+invocation_logs = false
