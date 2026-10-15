@@ -1,3 +1,4 @@
+# yaml-language-server: $schema=https://json.schemastore.org/github-workflow.json
 # Builds the docs website (Next.js + Fumadocs, content from docs/) and
 # deploys it to GitHub Pages.
 #
@@ -79,7 +80,7 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     environment:
-      name: github-pages
+      name: ${{ 'github-pages' }}
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - id: deployment
